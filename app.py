@@ -87,10 +87,10 @@ def setup_sqlite_db():
 setup_sqlite_db()
 
 # ==========================================
-# 4. SEARCH FUNCTIONS
+# 4. SEARCH FUNCTIONS (Multi-Output UI Integration)
 # ==========================================
 def search_offline(arabic_text):
-    """Find the best local partial matches for a recited Quran passage."""
+    """Find the best local matches and return separated UI elements."""
     conn = sqlite3.connect(SQL_DB_FILE)
     c = conn.cursor()
     c.execute("SELECT surah, ayah, arabic_text, clean_text FROM quran_verses")
@@ -107,29 +107,51 @@ def search_offline(arabic_text):
     )
 
     if not matches or matches[0][1] < 60:
-        return f"🗣️ Recognized: '{arabic_text}'\n\n❌ No close match found offline."
+        return (
+            arabic_text,
+            "❌ No clear match found.\n\n"
+            "Try reciting 5–10 words closer to the microphone.",
+            "",
+        )
 
-    result_text = (
-        f"🗣️ Recognized: '{arabic_text}'\n"
-        "📴 Mode: OFFLINE LOCAL SEARCH\n"
-        + "=" * 40
-        + "\n\n"
-    )
-    for _, score, index in matches:
+    best_match_md = ""
+    alternatives_md = "### Other possible matches\n"
+
+    for i, (_, score, index) in enumerate(matches):
         if score >= 60:
             surah, ayah, exact_text, _ = all_verses[index]
-            result_text += (
-                f"📖 Surah {surah}, Ayah {ayah} — "
-                f"Match Accuracy: {round(score)}%\n"
-                f"Arabic: {exact_text}\n"
-                + "-" * 40
-                + "\n"
-            )
 
-    return result_text
+            if i == 0:
+                confidence = (
+                    "High"
+                    if score >= 85
+                    else "Possible match"
+                    if score >= 65
+                    else "Weak match"
+                )
+                best_match_md = (
+                    f"### Surah {surah} — Ayah {ayah}\n\n"
+                    "<div dir='rtl' style='font-size: 28px; "
+                    f"text-align: right; margin: 15px 0;'>{exact_text}</div>\n\n"
+                    f"**Match confidence:** {confidence}\n\n"
+                    f"**Similarity:** {round(score)}%"
+                )
+            else:
+                alternatives_md += (
+                    f"**Surah {surah}, Ayah {ayah}** — "
+                    f"Similarity: {round(score)}%\n\n"
+                    "<div dir='rtl' style='text-align: right;'>"
+                    f"{exact_text}</div>\n\n---\n"
+                )
+
+    if alternatives_md == "### Other possible matches\n":
+        alternatives_md = ""
+
+    return arabic_text, best_match_md, alternatives_md
+
 
 def search_online(arabic_text):
-    """Search Quran.com with browser-like headers and safe response handling."""
+    """Search Quran.com API, returning separated UI elements."""
     words = arabic_text.split()
     search_query = " ".join(words[:4]) if len(words) > 4 else arabic_text
     headers = {
@@ -149,45 +171,52 @@ def search_online(arabic_text):
             timeout=10,
         )
         if response.status_code != 200:
-            return (
-                f"🗣️ Recognized: '{arabic_text}'\n\n"
+            return arabic_text, (
                 f"❌ API blocked or failed (HTTP {response.status_code})."
-            )
+            ), ""
 
         data = response.json()
         search_data = data.get("search", {})
         if search_data.get("total_results", 0) == 0:
-            return (
-                f"🗣️ Recognized: '{arabic_text}'\n\n"
+            return arabic_text, (
                 "❌ No matches found online, even with fuzzy search."
-            )
+            ), ""
 
-        result_text = (
-            f"🗣️ Recognized: '{arabic_text}'\n"
-            "🌐 Mode: ONLINE API (Quran.com Search)\n"
-            + "=" * 40 + "\n\n"
-        )
+        best_match_md = ""
+        alternatives_md = "### Other possible matches\n"
         for i, match in enumerate(search_data.get("results", [])[:3]):
             verse_key = match.get("verse_key", "Unknown")
             clean_text = re.sub(r"<[^>]+>", "", match.get("text", ""))
-            result_text += (
-                f"Option {i + 1}: Verse {verse_key}\n"
-                f"📖 Arabic: {clean_text}\n"
-                + "-" * 40 + "\n"
-            )
+            if i == 0:
+                best_match_md = (
+                    f"### Verse {verse_key}\n\n"
+                    "<div dir='rtl' style='font-size: 28px; "
+                    f"text-align: right; margin: 15px 0;'>{clean_text}</div>\n\n"
+                    "**Source:** ONLINE API"
+                )
+            else:
+                alternatives_md += (
+                    f"**Verse {verse_key}**\n\n"
+                    "<div dir='rtl' style='text-align: right;'>"
+                    f"{clean_text}</div>\n\n---\n"
+                )
 
-        return result_text
+        if alternatives_md == "### Other possible matches\n":
+            alternatives_md = ""
+
+        return arabic_text, best_match_md, alternatives_md
     except requests.RequestException as exc:
-        return f"⚠️ Online search failed: {exc}"
+        return arabic_text, f"⚠️ Online search failed: {exc}", ""
     except (ValueError, KeyError, TypeError) as exc:
-        return f"⚠️ Invalid response from Quran.com: {exc}"
+        return arabic_text, f"⚠️ Invalid response from Quran.com: {exc}", ""
 
 # ==========================================
 # 5. AUDIO PROCESSING BRIDGE
 # ==========================================
 def process_audio(audio_path, search_mode):
+    """Process audio and return transcription, best match, and alternatives."""
     if not audio_path:
-        return "Please upload or record an audio file."
+        return "", "⚠️ Please upload or record an audio file.", ""
     
     try:
         wave, sr = sf.read(audio_path, dtype="float32", always_2d=True)
@@ -205,7 +234,10 @@ def process_audio(audio_path, search_mode):
         final_arabic = " ".join(spelling_table.get(w, w) for w in raw_words)
         
         if not final_arabic.strip():
-            return "No speech detected. Please try again."
+            return "", (
+                "⚠️ No speech detected.\n\n"
+                "Try reciting 5–10 words closer to the microphone."
+            ), ""
 
         if "Online" in search_mode:
             return search_online(final_arabic)
@@ -213,31 +245,70 @@ def process_audio(audio_path, search_mode):
             return search_offline(final_arabic)
             
     except Exception as e:
-        return f"ERROR: {str(e)}"
+        return "", f"⚠️ ERROR: {str(e)}", ""
 
 # ==========================================
 # 6. USER INTERFACE
 # ==========================================
-with gr.Blocks(title="Quran Voice Engine") as iface:
-    gr.Markdown("## Quranic Voice Recognition & Search")
-    
+with gr.Blocks(
+    title="Quran Voice Finder",
+    theme=gr.themes.Default(text_size=gr.themes.sizes.text_lg),
+) as iface:
+    gr.Markdown("# Quran Voice Finder")
+
     with gr.Row():
-        with gr.Column():
-            audio_input = gr.Audio(sources=["microphone", "upload"], type="filepath", label="Recite a Verse")
-            search_toggle = gr.Radio(
-                choices=["Offline Database (Fuzzy Match)", "Online API (Exact Match & Pages)"], 
-                value="Offline Database (Fuzzy Match)", 
-                label="Select Search Engine"
+        with gr.Column(scale=1):
+            audio_input = gr.Audio(
+                sources=["microphone", "upload"],
+                type="filepath",
+                label="🎙️ Recite a verse or upload audio",
             )
-            submit_btn = gr.Button("Transcribe & Search", variant="primary")
-            
-        with gr.Column():
-            output_text = gr.Textbox(label="Match Results", lines=15, rtl=True, text_align="right")
-            
+
+            with gr.Accordion("Advanced Options", open=False):
+                search_toggle = gr.Radio(
+                    choices=[
+                        "Offline Database (Fuzzy Match)",
+                        "Online API (Exact Match & Pages)",
+                    ],
+                    value="Offline Database (Fuzzy Match)",
+                    label="Select Search Engine",
+                )
+
+            with gr.Row():
+                submit_btn = gr.Button("🔍 Find Verse", variant="primary")
+                clear_btn = gr.Button("↻ Try Again", variant="secondary")
+
+        with gr.Column(scale=1):
+            transcription_box = gr.Textbox(
+                label="What was heard",
+                interactive=False,
+                rtl=True,
+                text_align="right",
+            )
+
+            gr.Markdown("---")
+            best_match_box = gr.Markdown(
+                "### Best Match\nResults will appear here."
+            )
+
+            gr.Markdown("---")
+            alternatives_box = gr.Markdown("")
+
     submit_btn.click(
         fn=process_audio,
         inputs=[audio_input, search_toggle],
-        outputs=output_text
+        outputs=[transcription_box, best_match_box, alternatives_box],
+    )
+
+    clear_btn.click(
+        fn=lambda: (None, "", "### Best Match\nResults will appear here.", ""),
+        inputs=[],
+        outputs=[
+            audio_input,
+            transcription_box,
+            best_match_box,
+            alternatives_box,
+        ],
     )
 
 if __name__ == "__main__":
